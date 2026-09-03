@@ -186,6 +186,8 @@ docker run -d -p 8787:8787 \
 - **提示词文本和构建逻辑不在后端代码里**：手机在前台时把拼好的完整 system prompt（含 `{{RECENT_MESSAGES}}` / `{{IMPULSE_REASON}}` 占位符）注册给后端，后端只做字符串替换再发出去。**GitHub 仓库里看不到任何提示词/人设/越狱框架。**
 - 你的人设、最近聊天上下文、AI key 会存在**你自己的后端**（KV/sqlite/内存）—— 这是「App 关闭也能主动生成」的物理前提，作者服务器仍然不碰。
 - Cloudflare 用 Cron Triggers（`wrangler.toml` 已配 `crons=["* * * * *"]`）；Node 用内置 node-cron。
+- **KV 免费额度**（每天写入 1000 次）：空转轮次（没有角色要发）**零写入**，只有真的生成消息那一轮才写几次 KV，日常用量远在额度内。
+  想再省可在 CF 面板 → Worker → 变量 加 `PROACTIVE_TICK_MINUTES=5`（每 5 分钟检测一次；后端冷却本就 20 分钟，体感无差）。
 - ⚠️ Workers 有 CPU 时长/调用配额，适合中小规模；角色数量多、想要更稳的定时主动 → 用 VPS/Docker 长驻进程。
 
 ---

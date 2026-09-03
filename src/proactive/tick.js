@@ -46,6 +46,19 @@ const INBOX_SLOT_CHAR = 'inbox';
 //    滑窗/人设/记忆全是一周前的快照，硬生成出来必然「前文不搭」；且多半是用户早已不用的僵尸对。
 const STALE_RECORD_MS = 7 * 24 * 60 * 60 * 1000;
 
+// ⏱️ 可调检测间隔：cron 表达式固定每分钟触发（Workers 的 crons 不能读环境变量），
+//    由 PROACTIVE_TICK_MINUTES（默认 1）决定实际几分钟检测一次，其余分钟直接跳过（零读零写）。
+//    想省 KV 额度 / 减少空转的用户在 CF 面板加变量 PROACTIVE_TICK_MINUTES=5 即可，不用改代码。
+//    后端冷却本来就 20 分钟，3~5 分钟检测一次对体感几乎没影响。
+export function shouldRunTickNow(env, scheduledTime = Date.now()) {
+    const raw = env?.PROACTIVE_TICK_MINUTES
+        ?? (typeof process !== 'undefined' ? process.env?.PROACTIVE_TICK_MINUTES : undefined);
+    const n = Math.floor(Number(raw));
+    if (!Number.isFinite(n) || n <= 1) return true;
+    const minuteOfEpoch = Math.floor(Number(scheduledTime) / 60_000);
+    return minuteOfEpoch % n === 0;
+}
+
 export async function runProactiveTick(env) {
     const proactive = await createProactiveStore(env);
     const outbox = await createOutboxStore(env);
@@ -54,15 +67,25 @@ export async function runProactiveTick(env) {
     const tickStart = Date.now();
 
     // 🔒 重入锁：Workers scheduled 无重入守卫，tick 超 60s 时下一轮 cron 会并发 → 同一 pair 双发双扣费。
-    //    抢不到锁（已有 tick 在跑）就直接退出本轮。锁带 TTL，tick 崩溃也会自动释放。
+    //    锁带 TTL，tick 崩溃也会自动释放。
     //    ⚠️ TTL 必须 ≥ 单 pair 最长耗时：tool-loop(≤25s 预算) + runGeneration(≤180s) + 余量 → 取 300s。
-    //    旧值 120s < 180s 生成 → 锁会在生成中途过期 → 下轮 cron 抢到锁并发 → 双发隐患复活。
     //    （CAS claimFireIfStale 仍兜底防同一对双发，长锁是第二道防线 + 防多 pair 重叠空耗。）
+    //
+    // 💸 KV 写入额度：锁改成【懒抢】——只在真的要为某个 pair 生成之前才抢，空转轮次一次写都不发。
+    //    旧版每轮开头 put 锁 + 结尾 delete 锁 + put 游标 = 3 次写/分钟 = 4320 次/天，
+    //    直接吃穿 Cloudflare KV 免费版每天 1000 次写入额度，用户反馈「什么都没发额度就没了」。
+    //    空转轮次（全部 pair 都在冷却 / 未命中）只读不写，读额度（10 万/天）绰绰有余。
     const TICK_LOCK_TTL_MS = 300_000;
-    let lockHeld = false;
-    try { lockHeld = await proactive.acquireTickLock?.(TICK_LOCK_TTL_MS); } catch { lockHeld = true; /* 不支持锁的实现照旧跑 */ }
-    if (lockHeld === false) {
-        return { pairs: 0, fired: 0, skipped: 'locked' };
+    let lockHeld = false;      // 本轮是否已持有锁
+    let lockDenied = false;    // 抢锁失败（别的 tick 正在生成）→ 本轮不再生成
+    async function ensureTickLock() {
+        if (lockHeld || lockDenied) return lockHeld;
+        try {
+            const got = await proactive.acquireTickLock?.(TICK_LOCK_TTL_MS);
+            if (got === false) { lockDenied = true; return false; }
+            lockHeld = true;
+        } catch { lockHeld = true; /* 不支持锁的实现照旧跑 */ }
+        return lockHeld;
     }
 
     try {
@@ -155,6 +178,11 @@ export async function runProactiveTick(env) {
             //    ③两轮重叠 cron 各拍 tick 开头快照都过冷却闸→同一对双发(本 CAS 解决:第二轮新读到
             //      第一轮刚抢的值→claimFireIfStale 返回 false→跳过)。
             //    写独立 key，不走 patch(整条 blob)，否则会被 sync 覆盖。
+            // 🔒 真要生成了才抢重入锁（懒抢，见上）。抢不到=别的 tick 在跑 → 本轮到此为止，交给它。
+            if (!(await ensureTickLock())) {
+                console.warn('[proactive] 另一轮 tick 正在生成，本轮跳过剩余 pair');
+                break;
+            }
             const claimed = await proactive.claimFireIfStale(
                 rec.inboxId, rec.userId, rec.charId, now, BACKEND_FIRE_COOLDOWN_MS
             );
@@ -319,15 +347,17 @@ export async function runProactiveTick(env) {
     }
 
     // 🔄 保存轮转游标到「本轮处理到的绝对位置」，下轮从这接着扫（防总处理前缀、后面 pair 饿死）。
+    // 💸 只在游标真的变了才写：整轮跑完（processed === 全部）时 nextCursor === startIdx，不写，省 KV 写额度。
     try {
         const nextCursor = allPairs.length ? (startIdx + processed) % allPairs.length : 0;
-        await proactive.setTickCursor?.(nextCursor);
+        if (nextCursor !== startIdx) await proactive.setTickCursor?.(nextCursor);
     } catch { /* 不支持游标：忽略 */ }
 
     return { pairs: pairs.length, processed, fired };
 
     } finally {
         // 释放重入锁（即使中途抛错也释放，避免锁残留挡住后续 tick；TTL 是二重保险）。
-        try { await proactive.releaseTickLock?.(); } catch { /* ignore */ }
+        // 没抢过锁（空转轮）就不 delete —— delete 也算一次 KV 写入。
+        if (lockHeld) { try { await proactive.releaseTickLock?.(); } catch { /* ignore */ } }
     }
 }

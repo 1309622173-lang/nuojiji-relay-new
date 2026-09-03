@@ -29,11 +29,12 @@ serve({ fetch: app.fetch, port }, (info) => {
 
 // Phase 2：node-cron 定时主动生成（每分钟 tick，与 Workers cron 对齐）
 import cron from 'node-cron';
-import { runProactiveTick } from './src/proactive/tick.js';
+import { runProactiveTick, shouldRunTickNow } from './src/proactive/tick.js';
 
 let _ticking = false;
 cron.schedule('* * * * *', async () => {
     if (_ticking) return; // 防上一轮没跑完又进
+    if (!shouldRunTickNow({})) return; // PROACTIVE_TICK_MINUTES=N → 每 N 分钟一轮
     _ticking = true;
     try {
         const r = await runProactiveTick({}); // Node：env 空对象 → store 走 memory/sqlite
